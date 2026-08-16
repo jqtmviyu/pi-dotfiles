@@ -29,9 +29,31 @@
  * react(1)/spec(0); ambiguous text returns 'weak'. An explicit override via
  * `dev_router_mode` wins over classification.
  *
+ * TWO-PHASE PORT of dsh-anchored-standard (anchored tool bootstrap):
+ *
+ *   bootstrap (request #1): system prompt = persona ONLY — the exact probe
+ *     condition the routing-suite measured (P8-F/P11: system = persona text,
+ *     nothing else; context digest, skills, docs pointers all absent).
+ *   promoted (request #2+): the persona stays CONSTANT ("keep the Minimal
+ *     complete system prompt" — anchored-standard keeps the persona across
+ *     phases), while pi's functional sections return unchanged: the
+ *     CLAUDE.md/AGENTS.md <project_context> digest, the skills list, and the
+ *     Pi documentation pointers (so pi self-questions resolve against the
+ *     installed docs/*.md instead of source-code spelunking).
+ *
+ *   Promotion signal = the first durable `tool_call` OR the first settled
+ *   agent turn (promoteOn: 'either' — a text-only first reply cannot trap
+ *   the session in bootstrap). Resume/reload derive the phase from persisted
+ *   session entries, so a resumed session starts promoted.
+ *
  * Implementation notes for pi:
  *  - `before_agent_start` fires once per USER turn; the returned systemPrompt
- *    becomes an override for the WHOLE agent run.
+ *    overrides that run's system prompt.
+ *  - pi's persona section is its default identity paragraph ("You are an
+ *    expert coding assistant operating inside pi…"), replaced surgically by
+ *    applyPersonaSection — never drop the functional sections (§5.6 router
+ *    amnesia), never append the persona after pi's identity (P6 position,
+ *    A2 identity mixing).
  *  - thinking stays at "max" via settings.json defaultThinkingLevel + the
  *    model's thinkingLevelMap (deepseek: max -> "max").
  *
@@ -200,12 +222,49 @@ function isFlashModel(id?: string, name?: string): boolean {
   return /flash/i.test(String(id ?? "")) || /flash/i.test(String(name ?? ""));
 }
 
+// ── two-phase promotion (anchored-standard port) ────────────────────────────
+
+/**
+ * pi's default persona section — the identity paragraph the measured persona
+ * REPLACES. Everything else in the base system prompt is a functional section
+ * that must survive promotion.
+ */
+const PI_IDENTITY_PREFIX = "You are an expert coding assistant operating inside pi";
+
+/**
+ * Faithful port of router-core.applyPersona (dsh-routing-suite): replace ONLY
+ * pi's persona section (the default identity paragraph), keep every other
+ * section — tools list, guidelines, the Pi documentation pointers,
+ * <project_context> (CLAUDE.md/AGENTS.md digest), skills, and the trailing
+ * "Current working directory:" line.
+ *
+ * P6: identity conditioning is system-position-specific → the measured persona
+ * must LEAD. A2: two identities in one prompt land in the OOD gap (transition
+ * band), so pi's identity is dropped, never kept alongside the persona.
+ * Fallback (custom SYSTEM.md, or a future pi that rewords the default):
+ * prepend the persona and keep everything — never drop sections (§5.6 router
+ * amnesia).
+ */
+function applyPersonaSection(baseSystemPrompt: string, persona: string): string {
+  if (!baseSystemPrompt.startsWith(PI_IDENTITY_PREFIX)) {
+    return `${persona}\n\n${baseSystemPrompt}`;
+  }
+  const toolsMarker = "\n\nAvailable tools:";
+  const idx = baseSystemPrompt.indexOf(toolsMarker);
+  if (idx === -1) {
+    return `${persona}\n\n${baseSystemPrompt}`;
+  }
+  return `${persona}\n\n${baseSystemPrompt.slice(idx + 2)}`;
+}
+
 // ── per-session state ───────────────────────────────────────────────────────
 
 interface SessionState {
   guided: boolean;
   firstUserText: string;
   override: Mode | null; // explicit dev_router_mode override (null = classify)
+  /** True once the session produced its first durable promotion signal. */
+  promoted: boolean;
 }
 
 const sessions = new Map<string, SessionState>();
@@ -214,10 +273,26 @@ function stateFor(ctx: ExtensionContext): SessionState {
   const id = ctx.sessionManager.getSessionId() ?? "ephemeral";
   let state = sessions.get(id);
   if (!state) {
-    state = { guided: false, firstUserText: "", override: null };
+    state = { guided: false, firstUserText: "", override: null, promoted: false };
     sessions.set(id, state);
   }
   return state;
+}
+
+/**
+ * Resume/reload phase preservation (anchored-standard: "derive the phase from
+ * durable session events so resume and reload preserve it"). Any persisted
+ * message entry means the session already produced its first durable
+ * assistant message or tool call (promoteOn: 'either') — a resumed session
+ * skips bootstrap and starts promoted.
+ */
+function hasPromotionSignal(ctx: ExtensionContext): boolean {
+  try {
+    const entries = ctx.sessionManager.getEntries();
+    return Array.isArray(entries) && entries.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 /** Effective mode: explicit override wins, else classify the first task. */
@@ -228,7 +303,12 @@ function effectiveMode(state: SessionState): Mode {
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     const id = ctx.sessionManager.getSessionId() ?? "ephemeral";
-    sessions.set(id, { guided: false, firstUserText: "", override: null });
+    sessions.set(id, {
+      guided: false,
+      firstUserText: "",
+      override: null,
+      promoted: hasPromotionSignal(ctx),
+    });
   });
 
   // ── capture the first real user message text for classification ─────────
@@ -244,6 +324,16 @@ export default function (pi: ExtensionAPI) {
     return { action: "transform", text: text + guide };
   });
 
+  // ── promotion signals (anchored-standard promoteOn: 'either') ───────────
+  // The first durable tool/call OR the first settled agent turn ends the
+  // bootstrap phase; request #2+ sees the resident (full-context) prompt.
+  pi.on("tool_call", async (_event, ctx) => {
+    stateFor(ctx).promoted = true;
+  });
+  pi.on("agent_settled", async (_event, ctx) => {
+    stateFor(ctx).promoted = true;
+  });
+
 // ── per-turn persona injection (task-aware routing) ──────────────────────
 // The effective persona INCLUDING the weak-band deep-converge anchor. Kept
 // as the single source of truth so dev_router_status reports exactly what is
@@ -255,15 +345,24 @@ function buildPersona(mode: Mode, modelId?: string, modelName?: string): string 
   return bandOf(mode) === "weak" ? base + DEEP_CONVERGE : base;
 }
 
-pi.on("before_agent_start", async (_event, ctx) => {
+  // ── two-phase system prompt (anchored-standard port) ────────────────────
+  // bootstrap (request #1): persona-only — the exact probe condition
+  //   (P8-F/P11: system = persona text, nothing else).
+  // promoted (request #2+): the persona stays CONSTANT (anchored-standard:
+  //   "keep the Minimal complete system prompt"), while pi's functional
+  //   sections return unchanged — CLAUDE.md/AGENTS.md <project_context>,
+  //   skills list, Pi documentation pointers (so pi self-questions resolve
+  //   against the installed docs instead of source-code spelunking).
+  pi.on("before_agent_start", async (event, ctx) => {
     const state = stateFor(ctx);
     const mode = effectiveMode(state);
     const model = ctx.model as { id?: string; name?: string } | undefined;
     const persona = buildPersona(mode, model?.id, model?.name);
-    const cwd = (ctx.cwd ?? "").replace(/\\/g, "/");
-    return {
-      systemPrompt: `${persona}\n\nCurrent working directory: ${cwd}`,
-    };
+    if (!state.promoted) {
+      const cwd = (ctx.cwd ?? "").replace(/\\/g, "/");
+      return { systemPrompt: `${persona}\n\nCurrent working directory: ${cwd}` };
+    }
+    return { systemPrompt: applyPersonaSection(event.systemPrompt, persona) };
   });
 
   // ── dev_router_status: expose routing state to the model itself ──────────
@@ -271,8 +370,8 @@ pi.on("before_agent_start", async (_event, ctx) => {
     name: "dev_router_status",
     label: "Router Status",
     description:
-      "Show this session's reasoning-mode routing: mode, band, persona, override state. "
-      + "Use it to see which routing mode the current task is running under.",
+      "Show this session's reasoning-mode routing: phase, mode, band, persona, override state. "
+      + "Use it to see which routing mode and bootstrap phase the current task is running under.",
     promptSnippet: "Show the current reasoning-mode routing status",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
@@ -281,6 +380,7 @@ pi.on("before_agent_start", async (_event, ctx) => {
       const model = ctx.model as { id?: string; name?: string } | undefined;
       const persona = buildPersona(mode, model?.id, model?.name).replace(/\n/g, " / ");
       const lines = [
+        `phase=${state.promoted ? "promoted" : "bootstrap"}`,
         `mode=${fmtMode(mode)} (band=${bandFor(mode)})`,
         `persona=${persona.slice(0, 200)}`,
         `override=${state.override === null ? "auto (classify first task)" : fmtMode(state.override)}`,
@@ -289,7 +389,7 @@ pi.on("before_agent_start", async (_event, ctx) => {
       ];
       return {
         content: [{ type: "text", text: lines.join("\n") }],
-        details: { mode, band: bandFor(mode) },
+        details: { phase: state.promoted ? "promoted" : "bootstrap", mode, band: bandFor(mode) },
       };
     },
   });
