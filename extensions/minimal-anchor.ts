@@ -5,11 +5,12 @@
  *
  * Bootstrap（请求 #1）：system 仅为 SPEC_PERSONA；工具为 dsh minimal 的
  * [bash, str_replace_editor]（使用 dsh 的 schema/description；bash 在 pi 自己的
- * shell 后端中运行）。
+ * shell 后端中运行）；在全新会话中主动发送一条首个用户消息（hi）作为词汇锚点。
  *
  * Promoted（首个 tool_call 或 agent_settled）：bash 重新注册为 pi 的原始定义，
- * 恢复 bootstrap 前的工具快照，persona 保持置前，同时恢复 pi 的功能区段——但
- * 每轮都会移除 <available_skills>（模型看不到 skills；/skill:name 仍然有效）。
+ * 恢复 bootstrap 前的工具快照，persona 保持置前，同时恢复 pi 的全部功能区段
+ * （含 <available_skills>；/skill:name 始终有效）。
+ * 第一轮（bootstrap hi）本来就是整体替换为纯 persona，因此无需单独移除 skills。
  *
  * 文件位置：~/.pi/agent/extensions/。
  * 该扩展会被全局自动发现。
@@ -26,9 +27,11 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 
-// ── persona ────────────────────────────────────────────────────────────────
+// ── persona 与种子 ──────────────────────────────────────────────────────────
 
 const SPEC_PERSONA = "You are a helpful software engineer assistant."; // 与原文逐字节一致，包括句号
+/** 全新会话主动发送的首条用户消息（词汇锚点）。 */
+const SEED_FIRST_MESSAGE = "hi";
 
 // ── bash：dsh 的 schema/description，使用 pi 自己的执行后端 ────────────────
 
@@ -135,16 +138,8 @@ function runEditor(params: {
 
 const PI_IDENTITY_PREFIX = "You are an expert coding assistant operating inside pi";
 
-/** 删除 <available_skills>（模型看不到 skills，但 /skill:name 仍可用），保留 cwd 行。 */
-function stripSkillsSection(prompt: string): string {
-  const at = prompt.indexOf("<available_skills>");
-  if (at === -1) return prompt;
-  const cwd = prompt.indexOf("Current working directory:");
-  return cwd > at ? prompt.slice(0, at) + prompt.slice(cwd) : prompt.slice(0, at);
-}
-
-/** 只用 persona 替换 pi 的身份段落；保留除 skills 外的所有功能区段
- *  （tools、guidelines、docs、<project_context>、cwd）。
+/** 只用 persona 替换 pi 的身份段落；保留所有功能区段
+ *  （tools、guidelines、docs、<project_context>、<available_skills>、cwd）。
  *  回退方案（自定义 SYSTEM.md）：在前面添加 persona，绝不丢弃任何区段。 */
 function applyPersonaSection(baseSystemPrompt: string, persona: string): string {
   let rest = baseSystemPrompt;
@@ -152,7 +147,7 @@ function applyPersonaSection(baseSystemPrompt: string, persona: string): string 
     const idx = baseSystemPrompt.indexOf("\n\nAvailable tools:");
     if (idx !== -1) rest = baseSystemPrompt.slice(idx + 2);
   }
-  return `${persona}\n\n${stripSkillsSection(rest)}`;
+  return `${persona}\n\n${rest}`;
 }
 
 // ── 会话级状态 ───────────────────────────────────────────────────────
@@ -261,7 +256,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     const state: SessionState = { promoted: hasPromotionSignal(ctx), fullTools: null };
     sessions.set(ctx.sessionManager.getSessionId() ?? "ephemeral", state);
     if (state.promoted) {
@@ -271,6 +266,11 @@ export default function (pi: ExtensionAPI) {
         state.fullTools = saved;
         try { pi.setActiveTools(saved); } catch { /* 尽力而为 */ }
       }
+      return;
+    }
+    // 全新会话：主动发送首条用户消息（恢复/重新加载时绝不注入）
+    if (event.reason === "new" || event.reason === "startup") {
+      try { await pi.sendUserMessage(SEED_FIRST_MESSAGE); } catch { /* 未注入种子的会话仍然可以工作 */ }
     }
   });
 
