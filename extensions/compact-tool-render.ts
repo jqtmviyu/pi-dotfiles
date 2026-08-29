@@ -78,8 +78,8 @@ const _render = ToolExecutionComponent.prototype.render;
 ToolExecutionComponent.prototype.render = function (width: number): string[] {
 	const self = this as any;
 	if (compactMode && !self.expanded) {
-		// write/replace go to original render (shows diff preview)
-		if (self.toolName === "write" || self.toolName === "replace") {
+		// write/replace/edit go to original render (shows diff preview)
+		if (self.toolName === "write" || self.toolName === "replace" || self.toolName === "edit") {
 			return _render.call(self, width);
 		}
 		const line = compactLine(self);
